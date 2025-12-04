@@ -13,12 +13,12 @@ class TrainConfig:
     val_ratio: float = 0.2
 
     # モデル / 学習ハイパラ
-    batch_size: int = 1024
-    num_epochs: int = 150
+    batch_size: int = 512
+    num_epochs: int = 200
     lr: float = 3e-4
     weight_decay: float = 1e-5
-    hidden_dim: int = 512
-    num_layers: int = 5
+    hidden_dim: int = 384
+    num_layers: int = 6
     dropout: float = 0.1
 
     # scheduler (ReduceLROnPlateau)

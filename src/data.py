@@ -27,7 +27,9 @@ BOND_TYPE_LIST = [
     Chem.rdchem.BondType.TRIPLE,
     Chem.rdchem.BondType.AROMATIC,
 ]
-EDGE_FEAT_DIM = len(BOND_TYPE_LIST) + 2  # bond-type one-hot + conjugated + ring
+
+# bond-type one-hot + conjugated + ring + stereo(3)
+EDGE_FEAT_DIM = len(BOND_TYPE_LIST) + 2 + 3
 
 
 # -----------------------------
@@ -53,7 +55,7 @@ def atom_to_feat(atom: Chem.rdchem.Atom) -> torch.Tensor:
     if idx >= 0:
         one_hot[idx] = 1.0
 
-    # 既存の4スカラー特徴
+    # 基本スカラー特徴
     base_scalars = torch.tensor(
         [
             atom.GetFormalCharge(),
@@ -70,18 +72,44 @@ def atom_to_feat(atom: Chem.rdchem.Atom) -> torch.Tensor:
     if hyb in HYB_LIST:
         hyb_one_hot[HYB_LIST.index(hyb)] = 1.0
 
-    # 価数 & 原子番号（スカラー）
+    # 価数 & 原子番号
     valence = float(atom.GetTotalValence())
     atomic_num = float(atom.GetAtomicNum())
 
-    extra_scalars = torch.tensor([valence, atomic_num], dtype=torch.float32)
+    # H 原子数（置換基・局所環境）
+    num_h = float(atom.GetTotalNumHs(includeNeighbors=True))
+
+    # ring size 情報（5員環 / 6員環）
+    in_5ring = float(atom.IsInRingSize(5))
+    in_6ring = float(atom.IsInRingSize(6))
+
+    # 立体化学（CIP R/S/その他）
+    cip_R = 0.0
+    cip_S = 0.0
+    cip_other = 0.0
+    if atom.HasProp("_CIPCode"):
+        cip = atom.GetProp("_CIPCode")
+        if cip == "R":
+            cip_R = 1.0
+        elif cip == "S":
+            cip_S = 1.0
+        else:
+            cip_other = 1.0
+    cip_one_hot = torch.tensor([cip_R, cip_S, cip_other], dtype=torch.float32)
+
+    # 追加スカラー
+    extra_scalars = torch.tensor(
+        [valence, atomic_num, num_h, in_5ring, in_6ring],
+        dtype=torch.float32,
+    )
 
     feats = torch.cat(
         [
-            one_hot,          # |ATOM_LIST|
-            base_scalars,     # 4
-            hyb_one_hot,      # |HYB_LIST|
-            extra_scalars,    # 2
+            one_hot,       # |ATOM_LIST|
+            base_scalars,  # 4
+            hyb_one_hot,   # |HYB_LIST|
+            extra_scalars, # 5
+            cip_one_hot,   # 3
         ],
         dim=0,
     )
@@ -98,10 +126,18 @@ def bond_to_feat(bond: Chem.rdchem.Bond) -> torch.Tensor:
     conj = float(bond.GetIsConjugated())
     ring = float(bond.IsInRing())
 
+    # 立体化学（cis/trans/その他）
+    stereo = bond.GetStereo()
+    is_cis = float(stereo == Chem.rdchem.BondStereo.STEREOCIS)
+    is_trans = float(stereo == Chem.rdchem.BondStereo.STEREOTRANS)
+    has_stereo = float(stereo != Chem.rdchem.BondStereo.STEREONONE)
+    stereo_feats = torch.tensor([is_cis, is_trans, has_stereo], dtype=torch.float32)
+
     feats = torch.cat(
         [
-            one_hot,                   # bond type
+            one_hot,                                 # bond type
             torch.tensor([conj, ring], dtype=torch.float32),
+            stereo_feats,
         ],
         dim=0,
     )
@@ -111,18 +147,19 @@ def bond_to_feat(bond: Chem.rdchem.Bond) -> torch.Tensor:
 def mol_to_graph(
     mol: Chem.Mol,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    RDKit Mol -> (node_feats, edge_index, edge_attr)
+    """RDKit Mol -> (node_feats, edge_index, edge_attr)
 
     node_feats: (N, F)
     edge_index: (2, E)  無向グラフなので双方向を格納
     edge_attr:  (E, EDGE_FEAT_DIM)
     """
-    num_atoms = mol.GetNumAtoms()
-    node_feats = torch.stack(
-        [atom_to_feat(mol.GetAtomWithIdx(i)) for i in range(num_atoms)], dim=0
-    )  # (N, F)
+    # ノード特徴
+    node_feats_list: List[torch.Tensor] = []
+    for atom in mol.GetAtoms():
+        node_feats_list.append(atom_to_feat(atom))
+    node_feats = torch.stack(node_feats_list, dim=0)  # (N, F)
 
+    # エッジ
     src: List[int] = []
     dst: List[int] = []
     edge_attr_list: List[torch.Tensor] = []
@@ -191,46 +228,35 @@ class LambdaGNNDataset(Dataset):
         }
 
 
-def collate_graphs(batch: List[dict]):
+def collate_graphs(batch):
     """
-    batch: list of
-        {
-            "x":         (Ni,F),
-            "edge_index":(2,Ei),
-            "edge_attr": (Ei,Fe),
-            "y":         ()
-        }
-
-    -> x_batch:      (B, N_max, F)
-       adj_batch:    (B, N_max, N_max)
-       edge_feat_bt: (B, N_max, N_max, Fe)
-       mask:         (B, N_max)
-       y_batch:      (B,)
+    List[dict] -> batched グラフテンソル
+    x_batch:        (B, N_max, F)
+    adj_batch:      (B, N_max, N_max)
+    edge_feat_batch:(B, N_max, N_max, Fe)
+    mask:           (B, N_max)
+    y_batch:        (B,)
     """
-    batch_size = len(batch)
-    num_nodes_list = [b["x"].shape[0] for b in batch]
-    N_max = max(num_nodes_list)
-    feat_dim = batch[0]["x"].shape[1]
-    edge_feat_dim = batch[0]["edge_attr"].shape[1] if batch[0]["edge_attr"].numel() > 0 else EDGE_FEAT_DIM
+    xs = [b["x"] for b in batch]
+    edge_indices = [b["edge_index"] for b in batch]
+    edge_attrs = [b["edge_attr"] for b in batch]
+    ys = [b["y"] for b in batch]
 
-    x_batch = torch.zeros(batch_size, N_max, feat_dim, dtype=torch.float32)
-    adj_batch = torch.zeros(batch_size, N_max, N_max, dtype=torch.float32)
-    edge_feat_batch = torch.zeros(
-        batch_size, N_max, N_max, edge_feat_dim, dtype=torch.float32
-    )
-    mask = torch.zeros(batch_size, N_max, dtype=torch.float32)
-    y_batch = torch.zeros(batch_size, dtype=torch.float32)
+    B = len(xs)
+    N_max = max(x.shape[0] for x in xs)
+    F = xs[0].shape[1]
+    Fe = edge_attrs[0].shape[1] if edge_attrs[0].numel() > 0 else EDGE_FEAT_DIM
 
-    for i, item in enumerate(batch):
-        x = item["x"]
-        edge_index = item["edge_index"]
-        edge_attr = item["edge_attr"]
-        y = item["y"]
+    x_batch = torch.zeros((B, N_max, F), dtype=torch.float32)
+    adj_batch = torch.zeros((B, N_max, N_max), dtype=torch.float32)
+    edge_feat_batch = torch.zeros((B, N_max, N_max, Fe), dtype=torch.float32)
+    mask = torch.zeros((B, N_max), dtype=torch.float32)
+    y_batch = torch.stack(ys, dim=0)
 
+    for i, (x, edge_index, edge_attr) in enumerate(zip(xs, edge_indices, edge_attrs)):
         n = x.shape[0]
         x_batch[i, :n, :] = x
         mask[i, :n] = 1.0
-        y_batch[i] = y
 
         if edge_index.numel() > 0:
             src, dst = edge_index

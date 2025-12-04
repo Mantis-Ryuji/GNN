@@ -7,12 +7,58 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from rdkit import Chem
+from rdkit.Chem.Scaffolds import MurckoScaffold
+from collections import defaultdict
 
 from config import TrainConfig
 from data import LambdaGNNDataset, collate_graphs
 from model import GINERegressor
+
+
+def get_scaffold(smiles: str, include_chirality: bool = False) -> str:
+    """SMILES → Murcko Scaffold（scaffold SMILES）"""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return ""
+    return MurckoScaffold.MurckoScaffoldSmiles(
+        mol=mol,
+        includeChirality=include_chirality,
+    )
+
+
+def scaffold_split(smiles_list, val_ratio=0.2):
+    """
+    Scaffold-aware split
+    - 同じ scaffold グループは train か val のどちらか一方にしか入らない
+    """
+    scaffold_to_indices = defaultdict(list)
+    for idx, smi in enumerate(smiles_list):
+        scaf = get_scaffold(smi)
+        scaffold_to_indices[scaf].append(idx)
+
+    # 大きい scaffold グループから順に割り振る
+    scaffold_groups = sorted(
+        scaffold_to_indices.values(),
+        key=lambda x: len(x),
+        reverse=True,
+    )
+
+    N = len(smiles_list)
+    target_val_size = int(N * val_ratio)
+
+    train_idx = []
+    val_idx = []
+
+    for group in scaffold_groups:
+        if len(val_idx) < target_val_size:
+            val_idx.extend(group)
+        else:
+            train_idx.extend(group)
+
+    return train_idx, val_idx
 
 
 def rmse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -260,18 +306,17 @@ def main(resume: bool = True, resume_path: str = "src/runs/last.pt"):
 
     dataset = LambdaGNNDataset(df, cfg.smiles_col, cfg.target_col)
 
-    # ---- train / val split ----
-    N = len(dataset)
-    n_val = int(N * cfg.val_ratio)
-    n_train = N - n_val
+    valid_smiles = [dataset.smiles[i] for i in dataset.valid_indices]
 
-    train_ds, val_ds = random_split(
-        dataset,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(cfg.seed),
+    train_idx, val_idx = scaffold_split(
+        valid_smiles,
+        val_ratio=cfg.val_ratio,
     )
 
-    print(f"[Split] train={len(train_ds)}  val={len(val_ds)}")
+    train_ds = Subset(dataset, train_idx)
+    val_ds = Subset(dataset, val_idx)
+
+    print(f"[Split: Scaffold-aware] train={len(train_ds)}  val={len(val_ds)}")
 
     train_loader = DataLoader(
         train_ds,
