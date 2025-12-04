@@ -1,5 +1,5 @@
 datasets/
 sample/
 submit.zip
-__pychache__/
-src/runc/last.pt
+__pycache__/
+src/runs/last.pt
